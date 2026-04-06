@@ -1,8 +1,6 @@
 import { sendMessage, type SessionCallbacks } from "./claude-session.js";
 import { saveMemory, getMemories, getMessageCount, resetMessageCount } from "./database.js";
-
-// Compact after this many messages in a channel session
-const COMPACT_THRESHOLD = 40;
+import { DEFAULT_COMPACT_THRESHOLD } from "./config.js";
 
 // Post-compact guardrail (prevents Claude from auto-executing "pending tasks" from compacted context)
 const POST_COMPACT_GUARDRAIL = `POST-COMPACT GUARDRAIL (OBLIGATOIRE): Le contexte vient d'être compacté.
@@ -20,11 +18,12 @@ export function getChannelMemories(channelId: string): string[] {
 }
 
 /**
- * Check if compaction is needed based on message count.
+ * Check if compaction is needed based on message count and per-channel threshold.
  */
-export function needsCompaction(channelId: string): boolean {
+export function needsCompaction(channelId: string, compactThreshold?: number): boolean {
   const count = getMessageCount(channelId);
-  return count >= COMPACT_THRESHOLD;
+  const threshold = compactThreshold || DEFAULT_COMPACT_THRESHOLD;
+  return count >= threshold;
 }
 
 /**

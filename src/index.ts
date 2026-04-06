@@ -3,9 +3,9 @@ import {
   DISCORD_TOKEN, ALLOWED_USER_ID, GUILD_ID,
   MAX_CONCURRENT_SESSIONS, getChannelConfig,
 } from "./config.js";
-import { upsertSession, getSession } from "./database.js";
+import { upsertSession, getSession, getCostsByChannel, getTotalCosts, getDailyCosts, upsertChannelSetting, getAllChannelSettings, deleteChannelSetting } from "./database.js";
 import {
-  sendMessage, isSessionActive, getActiveSessionCount, shutdownAll,
+  sendMessage, isSessionActive, getActiveSessionCount, getActiveSessions, shutdownAll, stopSession, startTimeoutChecker,
   type SessionCallbacks,
 } from "./claude-session.js";
 import { StreamingResponse, formatToolActivity } from "./discord-formatter.js";
@@ -26,6 +26,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
 });
 
@@ -34,6 +35,9 @@ client.once("clientReady", () => {
   console.log(`📡 Guild: ${GUILD_ID}`);
   console.log(`👤 Utilisateur autorisé: ${ALLOWED_USER_ID}`);
   console.log(`🔧 Max sessions concurrentes: ${MAX_CONCURRENT_SESSIONS}`);
+
+  // Start the session timeout checker
+  startTimeoutChecker();
 });
 
 client.on("messageCreate", async (message: Message) => {
@@ -83,6 +87,52 @@ client.on("messageCreate", async (message: Message) => {
   await processMessage(channelId, channelName, content, channel, message);
 });
 
+// Handle reaction-based commands
+client.on("messageReactionAdd", async (reaction, user) => {
+  if (user.bot) return;
+  if (user.id !== ALLOWED_USER_ID) return;
+
+  const emoji = reaction.emoji.name;
+  const channel = reaction.message.channel;
+  if (channel.type !== ChannelType.GuildText) return;
+
+  const textChannel = channel as TextChannel;
+
+  switch (emoji) {
+    case "🛑": {
+      // Stop current session in this channel
+      if (isSessionActive(textChannel.id)) {
+        await stopSession(textChannel.id);
+        await textChannel.send("⏹️ Session arrêtée via réaction.");
+      }
+      break;
+    }
+    case "💰": {
+      // Show cost of last session
+      const since = Math.floor(Date.now() / 1000) - 86400; // last 24h
+      const costs = getCostsByChannel(since);
+      const channelCost = costs.find((c: any) => c.channel_name === textChannel.name);
+      if (channelCost) {
+        await textChannel.send(`💰 **#${textChannel.name} (24h):** $${channelCost.total_cost.toFixed(4)} · ${channelCost.sessions} sessions · ${channelCost.total_turns} tours`);
+      } else {
+        await textChannel.send(`💰 Aucune donnée de coût pour #${textChannel.name} (24h).`);
+      }
+      break;
+    }
+    case "🧠": {
+      // Show channel memory
+      const memories = getChannelMemories(textChannel.id);
+      if (memories.length === 0) {
+        await textChannel.send("🧠 Aucune mémoire compactée pour ce channel.");
+      } else {
+        const text = memories.map((m, i) => `**${i + 1}.** ${m.slice(0, 200)}${m.length > 200 ? "..." : ""}`).join("\n\n");
+        await textChannel.send(`🧠 **Mémoire de #${textChannel.name}:**\n${text}`);
+      }
+      break;
+    }
+  }
+});
+
 async function processMessage(
   channelId: string,
   channelName: string,
@@ -95,8 +145,8 @@ async function processMessage(
   // Initialize session in DB
   upsertSession(channelId, channelName, getSession(channelId)?.session_id || null, config.projectDir);
 
-  // Check if compaction is needed
-  if (needsCompaction(channelId)) {
+  // Check if compaction is needed (using per-channel threshold)
+  if (needsCompaction(channelId, config.compactThreshold)) {
     await channel.send("🧠 Compaction de la mémoire en cours...");
     try {
       const summary = await compactSession(channelId, channelName, config.projectDir, config.systemPrompt);
@@ -164,9 +214,10 @@ async function processMessage(
 
       await streamer.finish(result);
 
-      // Log activity for #général
+      // Log activity for #général with actual metrics
+      const costStr = result?.cost_usd ? ` · $${result.cost_usd.toFixed(4)}` : "";
       trackActivity(channelId, channelName, "completed",
-        `Session terminée (${result?.num_turns || 0} tours, ${Math.round((result?.duration_ms || 0) / 1000)}s)`
+        `Session terminée (${result?.num_turns || 0} tours, ${Math.round((result?.duration_ms || 0) / 1000)}s${costStr})`
       );
 
       // Remove reaction
@@ -191,7 +242,10 @@ async function processMessage(
   trackActivity(channelId, channelName, "message", content.slice(0, 200));
 
   try {
-    await sendMessage(channelId, channelName, content, config.projectDir, systemPrompt, callbacks, memories);
+    await sendMessage(channelId, channelName, content, config.projectDir, systemPrompt, callbacks, memories, {
+      model: config.model,
+      maxTurns: config.maxTurns,
+    });
   } catch (err) {
     await channel.send(`**Erreur:** ${err}`);
     trackActivity(channelId, channelName, "error", String(err).slice(0, 200));
@@ -229,7 +283,7 @@ async function routeToChannel(targetChannelName: string, command: string, source
   // Send the command to the target channel
   await targetChannel.send(`📥 **Commande de #général:** ${command}`);
 
-  // Trigger processing in the target channel (simulate a message)
+  // Trigger processing in the target channel
   const config = getChannelConfig(targetChannel.id, targetChannelName);
   upsertSession(targetChannel.id, targetChannelName, getSession(targetChannel.id)?.session_id || null, config.projectDir);
 
@@ -250,7 +304,6 @@ async function routeToChannel(targetChannelName: string, command: string, source
       trackActivity(targetChannel.id, targetChannelName, "routed-completed",
         `Commande de #général terminée: ${command.slice(0, 100)}`
       );
-      // Notify source channel
       await sourceChannel.send(`✅ #${targetChannelName} a terminé la commande.`);
     },
     onError: (err) => streamer.sendError(err),
@@ -261,7 +314,10 @@ async function routeToChannel(targetChannelName: string, command: string, source
   trackActivity(targetChannel.id, targetChannelName, "routed", `Commande de #général: ${command.slice(0, 100)}`);
 
   try {
-    await sendMessage(targetChannel.id, targetChannelName, command, config.projectDir, config.systemPrompt, callbacks, memories);
+    await sendMessage(targetChannel.id, targetChannelName, command, config.projectDir, config.systemPrompt, callbacks, memories, {
+      model: config.model,
+      maxTurns: config.maxTurns,
+    });
   } catch (err) {
     await sourceChannel.send(`❌ Erreur dans #${targetChannelName}: ${err}`);
   }
@@ -273,12 +329,19 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
 
   switch (action) {
     case "status": {
-      const sessions = getActiveSessionCount();
+      const activeSessions = getActiveSessions();
       const queues = Array.from(messageQueues.entries())
         .filter(([_, q]) => q.length > 0)
         .map(([id, q]) => `  #${client.channels.cache.get(id)?.toString() || id}: ${q.length} en attente`);
 
-      let status = `**Sessions actives:** ${sessions}/${MAX_CONCURRENT_SESSIONS}`;
+      let status = `**Sessions actives:** ${activeSessions.length}/${MAX_CONCURRENT_SESSIONS}`;
+      if (activeSessions.length > 0) {
+        const details = activeSessions.map(s => {
+          const age = Math.round((Date.now() - s.lastHeartbeat) / 1000);
+          return `  #${s.channelName} (dernier heartbeat: ${age}s)`;
+        });
+        status += "\n" + details.join("\n");
+      }
       if (queues.length > 0) status += "\n**Files d'attente:**\n" + queues.join("\n");
       await channel.send(status);
       break;
@@ -290,15 +353,12 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
         const guild = client.guilds.cache.get(GUILD_ID);
         const ch = guild?.channels.cache.find(c => c.name === target);
         if (ch) {
-          const { stopSession } = await import("./claude-session.js");
           await stopSession(ch.id);
           await channel.send(`⏹️ Session #${target} arrêtée.`);
         } else {
           await channel.send(`❌ Channel #${target} introuvable.`);
         }
       } else {
-        // Stop current channel
-        const { stopSession } = await import("./claude-session.js");
         await stopSession(channel.id);
         await channel.send("⏹️ Session arrêtée.");
       }
@@ -322,13 +382,168 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
       break;
     }
 
+    case "costs":
+    case "cost":
+    case "usage": {
+      const period = parts[1] || "today";
+      let since: number;
+      const now = Math.floor(Date.now() / 1000);
+
+      switch (period) {
+        case "week": since = now - 7 * 86400; break;
+        case "month": since = now - 30 * 86400; break;
+        case "all": since = 0; break;
+        default: since = now - 86400; break; // today
+      }
+
+      const total = getTotalCosts(since);
+      const byChannel = getCostsByChannel(since);
+      const daily = getDailyCosts();
+
+      let msg = `**💰 Coûts (${period}):**\n`;
+      msg += `Total: **$${(total?.total_cost || 0).toFixed(4)}** · ${total?.sessions || 0} sessions · ${total?.total_turns || 0} tours\n\n`;
+
+      if (byChannel.length > 0) {
+        msg += "**Par channel:**\n";
+        for (const c of byChannel) {
+          msg += `  #${c.channel_name}: $${c.total_cost.toFixed(4)} (${c.sessions} sessions, ${c.total_turns} tours)\n`;
+        }
+      }
+
+      if (daily.length > 0 && period !== "today") {
+        msg += "\n**Par jour (14 derniers):**\n";
+        for (const d of daily.slice(0, 7)) {
+          msg += `  ${d.day}: $${d.cost.toFixed(4)} (${d.sessions} sessions)\n`;
+        }
+      }
+
+      await channel.send(msg);
+      break;
+    }
+
+    case "set": {
+      // !set channel-name key value
+      // !set max-turns 20 (current channel)
+      // !set webcam model sonnet
+      let targetChannel: string;
+      let key: string;
+      let value: string;
+
+      if (parts.length >= 4) {
+        // !set channel-name key value
+        targetChannel = parts[1];
+        key = parts[2];
+        value = parts.slice(3).join(" ");
+      } else if (parts.length === 3) {
+        // !set key value (current channel)
+        targetChannel = channel.name;
+        key = parts[1];
+        value = parts[2];
+      } else {
+        await channel.send(`**Usage:** \`!set [channel] key value\`
+**Clés disponibles:** max-turns, model, compact-threshold, streaming, project-dir
+**Exemples:**
+\`!set max-turns 20\` — ce channel
+\`!set webcam model sonnet\` — channel spécifique
+\`!set liens streaming false\``);
+        break;
+      }
+
+      const settings: Record<string, any> = {};
+      switch (key) {
+        case "max-turns":
+        case "maxturns":
+          settings.max_turns = parseInt(value) || 0;
+          break;
+        case "model":
+          if (!["opus", "sonnet", "haiku"].includes(value)) {
+            await channel.send(`❌ Modèle invalide. Choix: opus, sonnet, haiku`);
+            return;
+          }
+          settings.model = value;
+          break;
+        case "compact-threshold":
+        case "compact":
+          settings.compact_threshold = parseInt(value) || 40;
+          break;
+        case "streaming":
+          settings.streaming = value === "true" || value === "1" ? 1 : 0;
+          break;
+        case "project-dir":
+        case "dir":
+          settings.project_dir = value;
+          break;
+        default:
+          await channel.send(`❌ Clé inconnue: \`${key}\`. Valides: max-turns, model, compact-threshold, streaming, project-dir`);
+          return;
+      }
+
+      upsertChannelSetting(targetChannel, settings);
+      await channel.send(`✅ **#${targetChannel}**: \`${key}\` = \`${value}\``);
+      break;
+    }
+
+    case "config": {
+      // Show all channel configs
+      const target = parts[1]?.replace("#", "") || channel.name;
+      const config = getChannelConfig(channel.id, target);
+      const dbSettings = getAllChannelSettings();
+
+      if (parts[1] === "all" || parts[1] === "list") {
+        let msg = "**⚙️ Configuration des channels:**\n\n";
+        // Show DB overrides
+        if (dbSettings.length > 0) {
+          msg += "**Overrides (via !set):**\n";
+          for (const s of dbSettings) {
+            const fields = [];
+            if (s.max_turns != null) fields.push(`max-turns=${s.max_turns}`);
+            if (s.model != null) fields.push(`model=${s.model}`);
+            if (s.compact_threshold != null) fields.push(`compact=${s.compact_threshold}`);
+            if (s.streaming != null) fields.push(`streaming=${!!s.streaming}`);
+            if (fields.length > 0) {
+              msg += `  #${s.channel_name}: ${fields.join(", ")}\n`;
+            }
+          }
+        } else {
+          msg += "Aucun override. Tout est en config par défaut.\n";
+        }
+        await channel.send(msg);
+      } else {
+        await channel.send(`**⚙️ Config de #${target}:**
+  Model: \`${config.model}\`
+  Max turns: \`${config.maxTurns || "illimité"}\`
+  Compaction: \`${config.compactThreshold} messages\`
+  Streaming: \`${config.streaming}\`
+  Project dir: \`${config.projectDir}\`
+  System prompt: \`${config.systemPrompt.slice(0, 100)}...\``);
+      }
+      break;
+    }
+
+    case "unset": {
+      // !unset channel-name — remove all DB overrides
+      const target = parts[1]?.replace("#", "") || channel.name;
+      deleteChannelSetting(target);
+      await channel.send(`🗑️ Overrides supprimés pour #${target}. Retour aux valeurs par défaut.`);
+      break;
+    }
+
     case "help": {
       await channel.send(`**Commandes Jarvis:**
 \`!status\` — Sessions actives et files d'attente
 \`!stop [#channel]\` — Arrêter une session
 \`!reset\` — Réinitialiser le contexte de ce channel
 \`!memory\` — Voir la mémoire de ce channel
+\`!costs [today|week|month|all]\` — Dashboard des coûts
+\`!set [channel] key value\` — Modifier un paramètre
+\`!config [channel|all]\` — Voir la configuration
+\`!unset [channel]\` — Supprimer les overrides
 \`!help\` — Cette aide
+
+**Réactions rapides:**
+🛑 — Arrêter la session du channel
+💰 — Voir le coût (24h)
+🧠 — Voir la mémoire compactée
 
 **Depuis #général:**
 \`@#channel-name message\` — Envoyer une commande à un autre channel

@@ -1,5 +1,5 @@
 import { Message, TextChannel, EmbedBuilder } from "discord.js";
-import type { TodoItem, StreamEvent } from "./types.js";
+import type { TodoItem, StreamResult } from "./types.js";
 import { EDIT_DEBOUNCE_MS, MAX_MESSAGE_LENGTH } from "./config.js";
 
 /**
@@ -71,7 +71,7 @@ export class StreamingResponse {
   }
 
   /** Finalize - send completion message */
-  async finish(result?: StreamEvent["result"]) {
+  async finish(result?: StreamResult | null) {
     this.isFinished = true;
     await this.flush();
 
@@ -79,13 +79,16 @@ export class StreamingResponse {
     if (this.statusMessage) {
       try {
         const embed = new EmbedBuilder()
-          .setColor(0x00cc66)
-          .setDescription("**Terminé**")
+          .setColor(result?.is_error ? 0xcc0000 : 0x00cc66)
+          .setDescription(result?.is_error ? "**Erreur**" : "**Terminé**")
           .setTimestamp();
 
-        if (result?.duration_ms) {
-          const secs = Math.round(result.duration_ms / 1000);
-          embed.setFooter({ text: `${secs}s · ${result.num_turns || 0} tours` });
+        const footerParts: string[] = [];
+        if (result?.duration_ms) footerParts.push(`${Math.round(result.duration_ms / 1000)}s`);
+        if (result?.num_turns) footerParts.push(`${result.num_turns} tours`);
+        if (result?.cost_usd) footerParts.push(`$${result.cost_usd.toFixed(4)}`);
+        if (footerParts.length > 0) {
+          embed.setFooter({ text: footerParts.join(" · ") });
         }
 
         await this.statusMessage.edit({ embeds: [embed] });
@@ -95,7 +98,8 @@ export class StreamingResponse {
     // Send a new message (triggers notification) if we had streaming content
     if (this.messageChain.length > 0 || this.textBuffer.trim()) {
       try {
-        await this.channel.send("Terminé.");
+        const costInfo = result?.cost_usd ? ` ($${result.cost_usd.toFixed(4)})` : "";
+        await this.channel.send(`Terminé.${costInfo}`);
       } catch {}
     }
   }

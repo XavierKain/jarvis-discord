@@ -10,6 +10,7 @@
     "discord.js": "^14.18.0"
   },
   "devDependencies": {
-    "@types/bun": "^1.2.0"
+    "@types/bun": "^1.2.0",
+    "typescript": "^6.0.2"
   }
 }

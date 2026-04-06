@@ -1,13 +1,20 @@
 import { Subprocess } from "bun";
-import type { StreamEvent, TodoItem } from "./types.js";
-import { CLAUDE_MODEL } from "./config.js";
-import { updateSessionId, incrementMessageCount, getSession } from "./database.js";
+import type { StreamEvent, StreamResult, TodoItem, TokenUsage } from "./types.js";
+
+// Mutable result tracker (written via closure in handleStreamEvent)
+interface SessionTracker {
+  result: StreamResult | null;
+  sessionId: string | null;
+  model: string | null;
+}
+import { SESSION_TIMEOUT_MS } from "./config.js";
+import { updateSessionId, incrementMessageCount, getSession, logUsage } from "./database.js";
 
 export interface SessionCallbacks {
   onText: (text: string) => void;
   onTodoUpdate: (todos: TodoItem[]) => void;
   onToolUse: (toolName: string, toolInput: Record<string, unknown>) => void;
-  onResult: (result: StreamEvent["result"]) => void;
+  onResult: (result: StreamResult | null) => void;
   onError: (error: string) => void;
   onSessionId: (sessionId: string) => void;
   onHeartbeat: () => void;
@@ -16,6 +23,8 @@ export interface SessionCallbacks {
 interface ActiveProcess {
   proc: Subprocess;
   channelId: string;
+  channelName: string;
+  lastHeartbeat: number;
   abortController: AbortController;
 }
 
@@ -26,6 +35,22 @@ const STRIPPED_ENV_KEYS = [
   "DISCORD_BOT_TOKEN",
   "DISCORD_TOKEN",
 ];
+
+// Session timeout checker (runs every 60s)
+let timeoutChecker: ReturnType<typeof setInterval> | null = null;
+
+export function startTimeoutChecker() {
+  if (timeoutChecker) return;
+  timeoutChecker = setInterval(() => {
+    const now = Date.now();
+    for (const [channelId, active] of activeProcesses.entries()) {
+      if (now - active.lastHeartbeat > SESSION_TIMEOUT_MS) {
+        console.log(`⏰ Timeout: session #${active.channelName} (${Math.round((now - active.lastHeartbeat) / 60000)} min sans heartbeat)`);
+        stopSession(channelId).catch(() => {});
+      }
+    }
+  }, 60_000);
+}
 
 function buildCleanEnv(): Record<string, string> {
   const env: Record<string, string> = {};
@@ -43,6 +68,14 @@ export function isSessionActive(channelId: string): boolean {
 
 export function getActiveSessionCount(): number {
   return activeProcesses.size;
+}
+
+export function getActiveSessions(): { channelId: string; channelName: string; lastHeartbeat: number }[] {
+  return Array.from(activeProcesses.values()).map(a => ({
+    channelId: a.channelId,
+    channelName: a.channelName,
+    lastHeartbeat: a.lastHeartbeat,
+  }));
 }
 
 export async function stopSession(channelId: string): Promise<void> {
@@ -76,6 +109,7 @@ export async function sendMessage(
   systemPrompt: string,
   callbacks: SessionCallbacks,
   memories: string[] = [],
+  options: { model?: string; maxTurns?: number } = {},
 ): Promise<void> {
   // If session is already active, stop it first (user sent new message)
   if (isSessionActive(channelId)) {
@@ -84,6 +118,7 @@ export async function sendMessage(
 
   const session = getSession(channelId);
   const sessionId = session?.session_id;
+  const model = options.model || "opus";
 
   // Build the full system prompt with memories
   let fullSystemPrompt = systemPrompt;
@@ -96,11 +131,16 @@ export async function sendMessage(
     "claude",
     "-p",
     "--output-format", "stream-json",
-    "--model", CLAUDE_MODEL,
+    "--model", model,
     "--verbose",
     "--dangerously-skip-permissions",
     "--system-prompt", fullSystemPrompt,
   ];
+
+  // Max turns limit
+  if (options.maxTurns && options.maxTurns > 0) {
+    args.push("--max-turns", String(options.maxTurns));
+  }
 
   // Resume existing session if we have one
   if (sessionId) {
@@ -121,14 +161,23 @@ export async function sendMessage(
     stdin: "pipe",
   });
 
-  activeProcesses.set(channelId, { proc, channelId, abortController });
+  const now = Date.now();
+  activeProcesses.set(channelId, { proc, channelId, channelName, lastHeartbeat: now, abortController });
 
-  // Track todos from this session
+  // Track todos and usage from this session
   const todos: TodoItem[] = [];
+  const tracker: SessionTracker = {
+    result: null,
+    sessionId: sessionId || null,
+    model: model,
+  };
+  const accumulatedUsage: TokenUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
 
   // Heartbeat timer
   const heartbeatInterval = setInterval(() => {
-    if (activeProcesses.has(channelId)) {
+    const active = activeProcesses.get(channelId);
+    if (active) {
+      active.lastHeartbeat = Date.now();
       callbacks.onHeartbeat();
     }
   }, 15000);
@@ -144,6 +193,10 @@ export async function sendMessage(
         const { done, value } = await reader.read();
         if (done) break;
 
+        // Update heartbeat on any data received
+        const active = activeProcesses.get(channelId);
+        if (active) active.lastHeartbeat = Date.now();
+
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
@@ -152,7 +205,7 @@ export async function sendMessage(
           if (!line.trim()) continue;
           try {
             const event: StreamEvent = JSON.parse(line);
-            handleStreamEvent(event, channelId, todos, callbacks);
+            handleStreamEvent(event, channelId, todos, callbacks, accumulatedUsage, tracker);
           } catch {
             // Not valid JSON, skip
           }
@@ -163,7 +216,7 @@ export async function sendMessage(
       if (buffer.trim()) {
         try {
           const event: StreamEvent = JSON.parse(buffer);
-          handleStreamEvent(event, channelId, todos, callbacks);
+          handleStreamEvent(event, channelId, todos, callbacks, accumulatedUsage, tracker);
         } catch {}
       }
     } catch (err) {
@@ -211,6 +264,33 @@ export async function sendMessage(
 
   incrementMessageCount(channelId);
 
+  // Log usage to DB
+  const costUsd = tracker.result?.cost_usd || 0;
+  const durationMs = tracker.result?.duration_ms || (Date.now() - now);
+  const numTurns = tracker.result?.num_turns || 0;
+
+  logUsage(
+    channelId, channelName, tracker.sessionId,
+    costUsd, durationMs, numTurns,
+    accumulatedUsage.input_tokens, accumulatedUsage.output_tokens,
+    accumulatedUsage.cache_read_input_tokens || 0,
+    tracker.model,
+  );
+
+  // Fire onResult callback — use accumulated data if result event was missing
+  if (tracker.result) {
+    callbacks.onResult(tracker.result);
+  } else {
+    // Construct a synthetic result from what we tracked
+    callbacks.onResult({
+      session_id: tracker.sessionId || "",
+      cost_usd: costUsd,
+      duration_ms: Date.now() - now,
+      num_turns: numTurns,
+      is_error: exitCode !== 0,
+    });
+  }
+
   if (exitCode !== 0 && exitCode !== null) {
     callbacks.onError(`Claude exited with code ${exitCode}`);
   }
@@ -221,24 +301,39 @@ function handleStreamEvent(
   channelId: string,
   todos: TodoItem[],
   callbacks: SessionCallbacks,
+  accumulatedUsage: TokenUsage,
+  tracker: SessionTracker,
 ) {
-  // Capture session ID
+  // Capture session ID from any event that has it
   if (event.session_id) {
     updateSessionId(channelId, event.session_id);
     callbacks.onSessionId(event.session_id);
+    tracker.sessionId = event.session_id;
   }
 
   switch (event.type) {
     case "system":
-      // Handle init event which contains session_id
       if (event.subtype === "init" && event.session_id) {
         updateSessionId(channelId, event.session_id);
         callbacks.onSessionId(event.session_id);
+        tracker.sessionId = event.session_id;
       }
       break;
 
     case "assistant":
       if (event.message?.content) {
+        // Track model from message
+        if (event.message.model) {
+          tracker.model = event.message.model;
+        }
+
+        // Accumulate token usage
+        if (event.message.usage) {
+          accumulatedUsage.input_tokens += event.message.usage.input_tokens || 0;
+          accumulatedUsage.output_tokens += event.message.usage.output_tokens || 0;
+          accumulatedUsage.cache_read_input_tokens = (accumulatedUsage.cache_read_input_tokens || 0) + (event.message.usage.cache_read_input_tokens || 0);
+        }
+
         for (const block of event.message.content) {
           if (block.type === "text" && block.text) {
             callbacks.onText(block.text);
@@ -273,13 +368,21 @@ function handleStreamEvent(
       break;
 
     case "result":
-      callbacks.onResult(event.result || null);
+      if (event.result) {
+        tracker.result = event.result;
+        // Don't call callbacks.onResult here — it's called after process exit
+        // to ensure we always fire it even if no result event was emitted
+      }
       break;
   }
 }
 
 // Graceful shutdown: stop all active sessions
 export async function shutdownAll(): Promise<void> {
+  if (timeoutChecker) {
+    clearInterval(timeoutChecker);
+    timeoutChecker = null;
+  }
   const channels = Array.from(activeProcesses.keys());
   await Promise.all(channels.map(ch => stopSession(ch)));
 }

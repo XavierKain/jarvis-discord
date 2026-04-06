@@ -69,4 +69,7 @@ export interface ChannelConfig {
   projectDir: string;
   systemPrompt: string;
   streaming: boolean; // show live updates or just final result
+  model: string; // claude model (opus, sonnet, haiku)
+  maxTurns: number; // 0 = unlimited
+  compactThreshold: number; // compact memory after N messages
 }
