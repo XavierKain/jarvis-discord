@@ -158,7 +158,7 @@ When a channel's session is busy, messages queue up (max 5). Each queued message
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/jarvis-discord.git
+git clone https://github.com/XavierKain/jarvis-discord.git
 cd jarvis-discord
 bun install
 ```
