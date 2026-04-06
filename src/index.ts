@@ -1,4 +1,11 @@
-import { Client, GatewayIntentBits, TextChannel, Message, ChannelType } from "discord.js";
+import { Client, GatewayIntentBits, TextChannel, Message, ChannelType, Interaction } from "discord.js";
+import {
+  buildDashboardEmbed,
+  buildChannelSelector,
+  handleDashboardButton,
+  handleDashboardSelect,
+  handleDashboardModal,
+} from "./dashboard.js";
 import {
   DISCORD_TOKEN, ALLOWED_USER_ID, GUILD_ID,
   MAX_CONCURRENT_SESSIONS, getChannelConfig,
@@ -129,6 +136,33 @@ client.on("messageReactionAdd", async (reaction, user) => {
         await textChannel.send(`🧠 **Mémoire de #${textChannel.name}:**\n${text}`);
       }
       break;
+    }
+  }
+});
+
+// Handle Discord component interactions (buttons, selects, modals)
+client.on("interactionCreate", async (interaction: Interaction) => {
+  if (interaction.user.id !== ALLOWED_USER_ID) {
+    if (interaction.isRepliable()) {
+      await interaction.reply({ content: "❌ Tu n'es pas autorisé.", ephemeral: true });
+    }
+    return;
+  }
+
+  try {
+    if (interaction.isButton()) {
+      await handleDashboardButton(interaction, client, GUILD_ID);
+    } else if (interaction.isStringSelectMenu()) {
+      await handleDashboardSelect(interaction, client, GUILD_ID);
+    } else if (interaction.isModalSubmit()) {
+      await handleDashboardModal(interaction, client, GUILD_ID);
+    }
+  } catch (err) {
+    console.error("Interaction error:", err);
+    if (interaction.isRepliable() && !interaction.replied) {
+      try {
+        await interaction.reply({ content: `❌ Erreur: ${err}`, ephemeral: true });
+      } catch {}
     }
   }
 });
@@ -328,6 +362,15 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
   const action = parts[0]?.toLowerCase();
 
   switch (action) {
+    case "dashboard":
+    case "dash": {
+      await channel.send({
+        embeds: [buildDashboardEmbed(client, GUILD_ID)],
+        components: [buildChannelSelector(client, GUILD_ID)],
+      });
+      break;
+    }
+
     case "status": {
       const activeSessions = getActiveSessions();
       const queues = Array.from(messageQueues.entries())
@@ -529,7 +572,8 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
     }
 
     case "help": {
-      await channel.send(`**Commandes Jarvis:**
+      await channel.send(`**Commandes DisClawd:**
+\`!dashboard\` — 🦅 Interface de configuration interactive (boutons, dropdowns)
 \`!status\` — Sessions actives et files d'attente
 \`!stop [#channel]\` — Arrêter une session
 \`!reset\` — Réinitialiser le contexte de ce channel

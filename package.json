@@ -1,11 +1,19 @@
 {
-  "name": "jarvis-discord",
-  "version": "1.0.0",
+  "name": "disclawd",
+  "version": "2.0.0",
+  "description": "An OpenClaw alternative on Discord. Multi-session Claude Code orchestrator that turns each Discord channel into an independent AI agent.",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
-    "dev": "bun --watch run src/index.ts"
+    "dev": "bun --watch run src/index.ts",
+    "typecheck": "tsc --noEmit"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XavierKain/disclawd.git"
+  },
+  "keywords": ["claude", "claude-code", "discord", "bot", "ai", "agent", "multi-session"],
+  "license": "MIT",
   "dependencies": {
     "discord.js": "^14.18.0"
   },

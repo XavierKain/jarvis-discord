@@ -1,25 +1,154 @@
-# Jarvis Discord — Multi-Session Claude Code Orchestrator
+# DisClawd 🦅
 
-A Discord bot that turns each channel into an independent Claude Code agent with persistent sessions, memory compaction, cross-channel awareness, and real-time streaming.
+> **An OpenClaw alternative on Discord. Keep using your Claude Code subscription.**
 
-**Built with:** Bun + Discord.js + SQLite + Claude Code CLI (`claude -p --output-format stream-json`)
+Turn every Discord channel into an independent Claude Code agent. Each channel = one project, one context, one parallel session — all driven by your existing Claude Code CLI (no API costs beyond your subscription).
+
+**Built with:** Bun + Discord.js + SQLite + Claude Code CLI
 
 ---
 
-## Why this exists
+## Why DisClawd?
 
-Claude Code is powerful but single-session. If you're running multiple projects — a website redesign, a lead pipeline, a YouTube automation, system admin — you need parallel, isolated AI sessions that maintain their own context.
+[OpenClaw](https://github.com/anomalyco/opencode) and similar tools require their own runtime, plugins, and a new mental model. DisClawd takes a different approach:
 
-Discord channels are the natural boundary: each channel = one agent, one project, one context. This bot spawns headless Claude Code processes per channel, streams output live, and handles session resumption, memory compaction, and inter-channel routing.
+- **Use your Claude Code subscription as-is** — DisClawd just spawns `claude -p` processes. No extra API keys, no token billing surprises.
+- **Discord is the UI** — no web app to host, no Electron client. You already have Discord on every device.
+- **Channels are agents** — each channel has its own working directory, system prompt, model, and persistent session. Switch projects by switching channels.
+- **Mobile-first by accident** — because Discord works everywhere, your Claude Code stack does too.
+- **Live streaming** — see Claude work in real time, with todo embeds and tool activity tracking.
 
 ```
-You (Discord)
+You (Discord on phone, laptop, anywhere)
   │
   ├── #refonte-site ──→ Claude session (Next.js project, /workspace/site)
   ├── #pipeline ──────→ Claude session (Lead gen, /workspace/pipeline)
-  ├── #système ───────→ Claude session (VPS admin, /home/xavier)
-  ├── #webcam ────────→ Claude session (Camera project, /home/xavier)
+  ├── #système ───────→ Claude session (VPS admin, /home/user)
+  ├── #webcam ────────→ Claude session (Camera project, /home/user)
   └── #général ───────→ Claude session (HQ — sees all activity, routes commands)
+```
+
+---
+
+## Features
+
+### Core
+- 🧵 **Per-channel sessions** with `--resume` for true context persistence
+- 🔀 **10 concurrent sessions** across channels (configurable)
+- 📥 **Message queuing** when a channel is busy (max 5 per channel)
+- 🧠 **Adaptive memory compaction** — summarize long conversations and reset, threshold tunable per channel
+- 📊 **Activity digest** for the `#général` channel — cross-channel awareness
+- 🚦 **Command routing** — from `#général`: `@#refonte fix the WebP images`
+
+### Visual control
+- 💬 **Rich embeds** for live status, todos, and tool activity
+- 🎛️ **Interactive dashboard** with buttons, select menus, and modals — no CLI flags
+- ⚡ **Live streaming** with debounced edits and code-block-aware splitting
+- 🟢 **Reaction shortcuts**: 🛑 stop · 💰 show cost · 🧠 show memory
+
+### Production-ready
+- 💰 **Cost tracking** — every session logged with tokens, duration, model. `!costs` dashboard with daily/weekly/monthly views
+- ⏰ **Session timeout** — auto-kill after 15 min without heartbeat, no zombie processes
+- 🎯 **Per-channel `--max-turns`** — prevent runaway sessions
+- 🤖 **Multi-model** — Opus for hard problems, Sonnet for analysis, Haiku for triage
+- 🗃️ **SQLite persistence** — sessions, memory, activity, usage, settings — all survive restarts
+- 🔒 **Secret hygiene** — Discord token stripped from subprocess env
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/XavierKain/disclawd.git
+cd disclawd
+bun install
+cp .env.example .env
+# edit .env with your Discord bot token + IDs
+bun run start
+```
+
+### `.env`
+
+```env
+DISCORD_BOT_TOKEN=your_bot_token
+ALLOWED_USER_ID=your_discord_user_id
+GUILD_ID=your_server_id
+CLAUDE_MODEL=opus              # default model (opus, sonnet, haiku)
+BASE_PROJECT_DIR=/home/user
+```
+
+### Prerequisites
+- [Bun](https://bun.sh)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated with your subscription
+- A Discord bot with **Message Content** and **Server Members** intents
+
+---
+
+## Configuring channels
+
+You have two ways to configure channels:
+
+### 1. Code defaults — `src/config.ts`
+
+```typescript
+export const CHANNEL_CONFIGS: Record<string, Partial<ChannelConfig>> = {
+  "my-project": {
+    projectDir: "/path/to/project",
+    systemPrompt: "You are a coding assistant for this Next.js project.",
+    streaming: true,
+    model: "opus",
+    maxTurns: 50,
+    compactThreshold: 40,
+  },
+  "links": {
+    systemPrompt: "Analyze any URL shared and provide a summary.",
+    streaming: false,
+    model: "sonnet",
+    maxTurns: 3,
+    compactThreshold: 20,
+  },
+};
+```
+
+### 2. Live config via Discord (no restart)
+
+```
+!dashboard          # interactive UI with buttons + dropdowns + modals
+!config #channel    # quick view
+!set max-turns 20   # set value for current channel
+!set webcam model sonnet
+!unset #channel     # reset to code defaults
+```
+
+The dashboard (`!dashboard`) is the easiest way: click buttons to edit, select dropdowns for models, type into modals for prompts. Settings are persisted in SQLite and override code defaults at runtime.
+
+---
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `!dashboard` | Interactive config UI with buttons + select menus |
+| `!status` | Active sessions + queues + heartbeats |
+| `!stop [#channel]` | Stop a session |
+| `!reset` | Clear current channel context |
+| `!memory` | View compacted memories |
+| `!costs [today\|week\|month\|all]` | Cost dashboard |
+| `!set [#channel] key value` | Set a parameter |
+| `!config [#channel\|all]` | View configuration |
+| `!unset [#channel]` | Remove DB overrides |
+| `!help` | List commands |
+
+### Reactions
+- 🛑 — stop the session in this channel
+- 💰 — show cost (24h)
+- 🧠 — show compacted memory
+
+### Routing from #général
+```
+@#refonte-site fix the WebP images
+dis à #pipeline de relancer le scraping
+dans #système, vérifie les crons
 ```
 
 ---
@@ -36,207 +165,66 @@ You (Discord)
         │             │            │
         ▼             ▼            ▼
 ┌──────────────────────────────────────────────────┐
-│              jarvis-discord (Bun)                  │
+│                 DisClawd (Bun)                     │
 │                                                    │
 │  index.ts ─── Message router + queue manager       │
 │     │                                              │
 │     ├── config.ts ─── Per-channel system prompts   │
-│     │                  + project directories        │
+│     │                  + DB-merged overrides        │
 │     │                                              │
 │     ├── claude-session.ts ─── Process spawner      │
-│     │   └── Bun.spawn("claude -p --stream-json")   │
+│     │   ├── Bun.spawn("claude -p --stream-json")   │
+│     │   ├── Heartbeat tracking + 15min timeout     │
+│     │   └── Token usage accumulation               │
+│     │                                              │
+│     ├── dashboard.ts ─── Interactive UI builder    │
+│     │   ├── Embeds for current config              │
+│     │   ├── Buttons for actions                    │
+│     │   ├── Select menus for choices               │
+│     │   └── Modals for text input                  │
 │     │                                              │
 │     ├── database.ts ─── SQLite (WAL mode)          │
-│     │   ├── sessions (channel → session_id)        │
-│     │   ├── memory (compacted summaries)           │
-│     │   └── activity_log (cross-channel events)    │
+│     │   ├── sessions      (channel → session_id)   │
+│     │   ├── memory        (compacted summaries)    │
+│     │   ├── activity_log  (cross-channel events)   │
+│     │   ├── usage_log     (cost + tokens per call) │
+│     │   └── channel_settings (runtime overrides)   │
 │     │                                              │
-│     ├── discord-formatter.ts ─── StreamingResponse │
-│     │   ├── Live text streaming (debounced edits)  │
-│     │   ├── Todo list embeds (real-time)           │
-│     │   └── Code block-aware message splitting     │
-│     │                                              │
+│     ├── discord-formatter.ts ─── Streaming UI      │
 │     ├── memory.ts ─── Compaction engine            │
-│     │   └── After 40 messages: summarize → reset   │
-│     │                                              │
-│     └── general-orchestrator.ts ─── Cross-channel  │
-│         ├── Activity digest injection              │
-│         └── Command routing (@#channel msg)         │
+│     └── general-orchestrator.ts ─── Routing + digest │
 └──────────────────────────────────────────────────┘
 ```
-
-### Core flow
-
-1. **Message arrives** in a Discord channel
-2. **Concurrency check** — max 5 simultaneous sessions across all channels
-3. **Queue if busy** — if this channel already has an active session, queue the message (max 5 per channel), react with ⏳
-4. **Load config** — per-channel system prompt + project directory
-5. **Check compaction** — if message_count ≥ 40, ask Claude to summarize, save to memory table, reset session
-6. **Inject context** — memories + activity digest (for #général)
-7. **Spawn process** — `claude -p --output-format stream-json --resume <session_id> --model opus <message>`
-8. **Stream output** — parse JSON events line by line, render live to Discord
-9. **Track todos** — intercept TaskCreate/TaskUpdate events, show as Discord embeds
-10. **On completion** — log activity, process queued messages, update session state
 
 ### Session lifecycle
 
 ```
-Channel first message → Create DB record (session_id = null)
-                      → Spawn claude -p (gets new session_id from init event)
+Channel first message → Spawn claude -p (gets new session_id from init event)
                       → Store session_id in DB
 
 Subsequent messages   → Resume with --resume <session_id>
                       → Same context, no cold start
 
-After 40 messages     → Compaction: summarize → save to memory table
-                      → Reset session_id to null (fresh session)
-                      → Next message starts new session with memory injection
+After N messages      → Compaction: summarize → save to memory table
+(N = compactThreshold)→ Reset session_id → next message starts fresh + memory
 
-User sends !reset     → Clear session_id → next message = fresh context
-```
-
----
-
-## Features
-
-### Per-channel isolation
-Each channel gets its own Claude Code process with:
-- **Custom system prompt** (e.g., "Tu es un agent de développement")
-- **Custom working directory** (e.g., `/workspace/my-nextjs-app`)
-- **Independent session persistence** via `--resume`
-
-### Real-time streaming
-Claude's output streams live to Discord via debounced message edits (1.5s throttle). Long outputs split across messages with code block awareness (properly closes/reopens ``` across splits).
-
-### Todo list tracking
-When Claude uses `TaskCreate`/`TaskUpdate` tools, the bot renders a live status embed:
-```
-🔄 Migrer les images en WebP
-✅ Installer sharp
-⬚ Déployer sur SiteGround
-⚡ Édition de next.config.js
-```
-
-### Memory compaction
-After 40 messages, the bot automatically:
-1. Asks Claude to summarize the conversation (10-15 bullet points)
-2. Saves the summary to a `memory` table
-3. Resets the session — next message starts fresh with injected memories
-4. **Post-compact guardrail**: prevents Claude from auto-executing "pending tasks" from the summary
-
-### Cross-channel awareness (#général)
-The `#général` channel acts as HQ:
-- Receives an **activity digest** of all other channels injected into its system prompt
-- Can **route commands** to other channels:
-  ```
-  @#refonte-site fix the WebP images
-  dis à #pipeline de relancer le scraping
-  dans #système, vérifie les crons
-  ```
-
-### Message queueing
-When a channel's session is busy, messages queue up (max 5). Each queued message gets a ⏳ reaction. After the current session completes, the next message in queue is automatically processed.
-
-### Commands
-| Command | Description |
-|---------|-------------|
-| `!status` | Show active sessions and queues |
-| `!stop [#channel]` | Stop a running session |
-| `!reset` | Clear session context (start fresh) |
-| `!memory` | View this channel's compacted memories |
-| `!help` | List commands |
-
----
-
-## Setup
-
-### Prerequisites
-- [Bun](https://bun.sh) runtime
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
-- A Discord bot token with Message Content intent
-
-### Installation
-
-```bash
-git clone https://github.com/XavierKain/jarvis-discord.git
-cd jarvis-discord
-bun install
-```
-
-### Configuration
-
-Create a `.env` file:
-
-```env
-DISCORD_BOT_TOKEN=your_bot_token
-ALLOWED_USER_ID=your_discord_user_id
-GUILD_ID=your_server_id
-CLAUDE_MODEL=opus              # or sonnet, haiku
-BASE_PROJECT_DIR=/home/user    # default working directory
-```
-
-Edit `src/config.ts` to define your channels:
-
-```typescript
-export const CHANNEL_CONFIGS: Record<string, Partial<ChannelConfig>> = {
-  "my-project": {
-    projectDir: "/path/to/project",
-    systemPrompt: "You are a coding assistant for this Next.js project.",
-    streaming: true,
-  },
-  "links": {
-    projectDir: "/home/user",
-    systemPrompt: "Analyze any URL shared and provide a summary.",
-    streaming: false, // send final result only
-  },
-};
-```
-
-### Run
-
-```bash
-bun run start
-# or with hot reload:
-bun run dev
-```
-
-### As a systemd service
-
-```ini
-[Unit]
-Description=Jarvis Discord Bot
-After=network.target
-
-[Service]
-Type=simple
-User=your_user
-WorkingDirectory=/path/to/jarvis-discord
-ExecStart=/usr/local/bin/bun run src/index.ts
-Restart=always
-RestartSec=5
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=multi-user.target
+15min inactivity      → Auto-kill (no heartbeat)
+User !reset           → Clear session_id → next message = fresh context
 ```
 
 ---
 
 ## Database schema
 
-SQLite with WAL mode, stored in `data/jarvis.db`:
-
 ```sql
--- One row per channel, tracks session state
+-- Per-channel session state
 CREATE TABLE sessions (
   channel_id TEXT PRIMARY KEY,
   channel_name TEXT NOT NULL,
-  session_id TEXT,            -- Claude Code session ID for --resume
+  session_id TEXT,
   project_dir TEXT NOT NULL,
-  last_activity INTEGER,
-  message_count INTEGER,      -- triggers compaction at 40
-  created_at INTEGER,
-  updated_at INTEGER
+  message_count INTEGER,
+  ...
 );
 
 -- Compacted conversation summaries
@@ -244,77 +232,68 @@ CREATE TABLE memory (
   channel_id TEXT NOT NULL,
   summary TEXT NOT NULL,
   created_at INTEGER,
-  PRIMARY KEY (channel_id, created_at)
+  ...
 );
 
--- Cross-channel activity log (injected into #général)
-CREATE TABLE activity_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+-- Cross-channel activity (injected into #général)
+CREATE TABLE activity_log (...);
+
+-- Per-session usage tracking
+CREATE TABLE usage_log (
   channel_id TEXT NOT NULL,
-  channel_name TEXT NOT NULL,
-  event_type TEXT NOT NULL,    -- message, completed, error, routed
-  summary TEXT NOT NULL,
-  created_at INTEGER
+  cost_usd REAL,
+  duration_ms INTEGER,
+  num_turns INTEGER,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  model TEXT,
+  ...
+);
+
+-- Runtime config overrides (set via !dashboard or !set)
+CREATE TABLE channel_settings (
+  channel_name TEXT PRIMARY KEY,
+  max_turns INTEGER,
+  model TEXT,
+  compact_threshold INTEGER,
+  streaming INTEGER,
+  system_prompt TEXT,
+  project_dir TEXT,
+  ...
 );
 ```
 
 ---
 
-## File structure
+## DisClawd vs OpenClaw vs raw Claude Code
 
-```
-jarvis-discord/
-├── src/
-│   ├── index.ts                 # Discord bot + message router (364 lines)
-│   ├── claude-session.ts        # Claude CLI process spawner (285 lines)
-│   ├── config.ts                # Channel configs + env vars (92 lines)
-│   ├── database.ts              # SQLite persistence layer (131 lines)
-│   ├── discord-formatter.ts     # Streaming renderer + embeds (276 lines)
-│   ├── general-orchestrator.ts  # Cross-channel routing + digest (71 lines)
-│   ├── memory.ts                # Compaction engine (73 lines)
-│   └── types.ts                 # TypeScript definitions (72 lines)
-├── data/                        # SQLite DB (gitignored)
-├── .env                         # Secrets (gitignored)
-├── package.json
-├── tsconfig.json
-└── README.md
-```
-
-**Total: ~1,364 lines of TypeScript**
+| | DisClawd | OpenClaw | Raw Claude Code |
+|---|---|---|---|
+| Uses your Claude Code subscription | ✅ | ❌ (own runtime) | ✅ |
+| Multi-session | ✅ 10 concurrent | ✅ | ❌ |
+| Discord native | ✅ | ❌ | ❌ |
+| Per-channel context | ✅ | ❌ | N/A |
+| Memory compaction | ✅ Adaptive | Plugin | ❌ |
+| Cost tracking | ✅ Built-in | Plugin | Manual |
+| Visual config UI | ✅ Discord | ✅ Web | ❌ |
+| Mobile access | ✅ Discord app | ❌ | ❌ |
+| Self-hosted | ✅ Single binary | ✅ | ✅ |
+| Setup complexity | Low (Bun + bot) | Medium | Low |
 
 ---
 
-## How it compares
+## Roadmap
 
-| Feature | jarvis-discord | Raw Claude Code | Claude Code + MCP |
-|---------|---------------|----------------|-------------------|
-| Multi-session | ✅ 5 concurrent | ❌ Single | ❌ Single |
-| Discord native | ✅ | ❌ (needs plugin) | ❌ |
-| Per-channel context | ✅ | N/A | N/A |
-| Session resumption | ✅ `--resume` | ✅ manual | ✅ manual |
-| Memory compaction | ✅ Auto at 40 msgs | ❌ | ❌ |
-| Cross-channel awareness | ✅ Activity digest | N/A | N/A |
-| Command routing | ✅ `@#channel msg` | N/A | N/A |
-| Live streaming to Discord | ✅ Debounced edits | N/A | N/A |
-| Todo tracking | ✅ Embeds | ✅ Terminal | ✅ Terminal |
-| Message queueing | ✅ Per-channel | N/A | N/A |
-
----
-
-## Design decisions
-
-**Why Bun?** — Native SQLite binding, fast subprocess spawning, no node_modules bloat for runtime. Discord.js works seamlessly with Bun.
-
-**Why SQLite?** — Zero-config persistence on a single VPS. WAL mode handles concurrent reads/writes. No external database dependency.
-
-**Why spawn processes instead of the SDK?** — Claude Code CLI (`claude -p`) gives you the full toolchain (file editing, bash, web search, agents) in a single command. The SDK would require reimplementing all of that. The CLI's `--output-format stream-json` provides typed events we can parse and render.
-
-**Why message queueing instead of multiplexing?** — Claude Code sessions are inherently sequential (one active tool use at a time). Queueing is simpler and matches the actual execution model.
-
-**Why compaction over infinite context?** — Token costs scale linearly with context size. After 40 messages, resuming with a 15-line summary + fresh session is cheaper and often more focused than carrying full context.
+- [ ] Webhook mode for automated channels (#liens, #newsletter)
+- [ ] Multi-user support (currently single-user via `ALLOWED_USER_ID`)
+- [ ] Slash commands (in addition to `!` prefix)
+- [ ] Export usage data to CSV / Google Sheets
+- [ ] Voice channel integration (transcribe → Claude → reply)
+- [ ] Plugin system for custom tool handlers
 
 ---
 
 ## License
 
-MIT
+MIT — do whatever you want.
