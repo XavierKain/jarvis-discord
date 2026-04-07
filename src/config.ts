@@ -153,6 +153,7 @@ export const DEFAULT_CHANNEL_CONFIG: Omit<ChannelConfig, "id" | "name"> = {
   maxTurns: DEFAULT_MAX_TURNS,
   compactThreshold: DEFAULT_COMPACT_THRESHOLD,
   skills: [],
+  autoResume: false, // disabled by default, enable per-channel with !set auto-resume true
 };
 
 /**
@@ -175,6 +176,7 @@ export function getChannelConfig(channelId: string, channelName: string): Channe
         ...(dbSetting.system_prompt != null && { systemPrompt: dbSetting.system_prompt }),
         ...(dbSetting.project_dir != null && { projectDir: dbSetting.project_dir }),
         ...(dbSetting.skills != null && { skills: dbSetting.skills.split(",").map((s: string) => s.trim()).filter(Boolean) }),
+        ...(dbSetting.auto_resume != null && { autoResume: !!dbSetting.auto_resume }),
       };
     }
   } catch {

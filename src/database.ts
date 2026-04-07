@@ -63,12 +63,30 @@ db.exec(`
     system_prompt TEXT,
     project_dir TEXT,
     skills TEXT,
+    auto_resume INTEGER,
     updated_at INTEGER DEFAULT (unixepoch())
+  );
+
+  CREATE TABLE IF NOT EXISTS pending_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT NOT NULL,
+    session_id TEXT,
+    original_prompt TEXT NOT NULL,
+    context_summary TEXT,
+    cut_reason TEXT NOT NULL,
+    cut_message TEXT NOT NULL,
+    retry_after INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER DEFAULT (unixepoch()),
+    resumed_at INTEGER
   );
 `);
 
 // Migrations — add columns that may not exist in older DBs
 try { db.exec("ALTER TABLE channel_settings ADD COLUMN skills TEXT"); } catch {}
+try { db.exec("ALTER TABLE channel_settings ADD COLUMN auto_resume INTEGER"); } catch {}
 try { db.exec("ALTER TABLE usage_log ADD COLUMN cache_read_tokens INTEGER DEFAULT 0"); } catch {}
 
 // Prepared statements
@@ -136,8 +154,8 @@ const stmts = {
   getChannelSetting: db.prepare("SELECT * FROM channel_settings WHERE channel_name = ?"),
   getAllChannelSettings: db.prepare("SELECT * FROM channel_settings ORDER BY channel_name"),
   upsertChannelSetting: db.prepare(`
-    INSERT INTO channel_settings (channel_name, max_turns, model, compact_threshold, streaming, system_prompt, project_dir, skills, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+    INSERT INTO channel_settings (channel_name, max_turns, model, compact_threshold, streaming, system_prompt, project_dir, skills, auto_resume, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
     ON CONFLICT(channel_name) DO UPDATE SET
       max_turns = COALESCE(excluded.max_turns, max_turns),
       model = COALESCE(excluded.model, model),
@@ -146,9 +164,29 @@ const stmts = {
       system_prompt = COALESCE(excluded.system_prompt, system_prompt),
       project_dir = COALESCE(excluded.project_dir, project_dir),
       skills = COALESCE(excluded.skills, skills),
+      auto_resume = COALESCE(excluded.auto_resume, auto_resume),
       updated_at = unixepoch()
   `),
   deleteChannelSetting: db.prepare("DELETE FROM channel_settings WHERE channel_name = ?"),
+
+  // Pending tasks (auto-resume)
+  insertPendingTask: db.prepare(`
+    INSERT INTO pending_tasks (channel_id, channel_name, session_id, original_prompt, context_summary, cut_reason, cut_message, retry_after, status, attempts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', 0)
+  `),
+  getWaitingTasks: db.prepare(`
+    SELECT * FROM pending_tasks WHERE status = 'waiting' AND retry_after <= ? ORDER BY created_at ASC
+  `),
+  getAllPendingTasks: db.prepare(`
+    SELECT * FROM pending_tasks WHERE status IN ('waiting', 'resumed') ORDER BY created_at DESC LIMIT 20
+  `),
+  getPendingTaskById: db.prepare("SELECT * FROM pending_tasks WHERE id = ?"),
+  updatePendingTaskStatus: db.prepare(`
+    UPDATE pending_tasks SET status = ?, resumed_at = CASE WHEN ? = 'resumed' THEN unixepoch() ELSE resumed_at END, attempts = attempts + 1
+    WHERE id = ?
+  `),
+  abandonPendingTask: db.prepare("UPDATE pending_tasks SET status = 'abandoned' WHERE id = ?"),
+  countWaitingTasks: db.prepare("SELECT COUNT(*) as count FROM pending_tasks WHERE status = 'waiting'"),
 };
 
 export function getSession(channelId: string) {
@@ -228,7 +266,7 @@ export function getAllChannelSettings() {
 
 export function upsertChannelSetting(
   channelName: string,
-  settings: { max_turns?: number | null; model?: string | null; compact_threshold?: number | null; streaming?: number | null; system_prompt?: string | null; project_dir?: string | null; skills?: string | null }
+  settings: { max_turns?: number | null; model?: string | null; compact_threshold?: number | null; streaming?: number | null; system_prompt?: string | null; project_dir?: string | null; skills?: string | null; auto_resume?: number | null }
 ) {
   stmts.upsertChannelSetting.run(
     channelName,
@@ -239,7 +277,41 @@ export function upsertChannelSetting(
     settings.system_prompt ?? null,
     settings.project_dir ?? null,
     settings.skills ?? null,
+    settings.auto_resume ?? null,
   );
+}
+
+// Pending tasks (auto-resume)
+export function insertPendingTask(
+  channelId: string, channelName: string, sessionId: string | null,
+  originalPrompt: string, contextSummary: string | null,
+  cutReason: string, cutMessage: string, retryAfter: number
+) {
+  return stmts.insertPendingTask.run(channelId, channelName, sessionId, originalPrompt, contextSummary, cutReason, cutMessage, retryAfter);
+}
+
+export function getWaitingTasks(now: number) {
+  return stmts.getWaitingTasks.all(now) as any[];
+}
+
+export function getAllPendingTasks() {
+  return stmts.getAllPendingTasks.all() as any[];
+}
+
+export function getPendingTaskById(id: number) {
+  return stmts.getPendingTaskById.get(id) as any;
+}
+
+export function updatePendingTaskStatus(id: number, status: string) {
+  stmts.updatePendingTaskStatus.run(status, status, id);
+}
+
+export function abandonPendingTask(id: number) {
+  stmts.abandonPendingTask.run(id);
+}
+
+export function countWaitingTasks(): number {
+  return (stmts.countWaitingTasks.get() as any)?.count || 0;
 }
 
 export function deleteChannelSetting(channelName: string) {

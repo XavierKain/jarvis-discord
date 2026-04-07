@@ -73,4 +73,30 @@ export interface ChannelConfig {
   maxTurns: number; // 0 = unlimited
   compactThreshold: number; // compact memory after N messages
   skills: string[]; // skill names to inject into system prompt
+  autoResume: boolean; // auto-resume tasks cut by rate limits
+}
+
+// Cut reason types
+export type CutReason = "rate_limit" | "session_timeout" | "weekly_quota" | "monthly_quota" | "max_turns" | "unknown";
+
+export interface CutInfo {
+  reason: CutReason;
+  message: string; // human-readable explanation
+  retryAfter: number; // unix timestamp (seconds) when to retry
+}
+
+export interface PendingTask {
+  id: number;
+  channel_id: string;
+  channel_name: string;
+  session_id: string | null;
+  original_prompt: string;
+  context_summary: string | null;
+  cut_reason: CutReason;
+  cut_message: string;
+  retry_after: number; // unix timestamp (seconds)
+  status: "waiting" | "resumed" | "completed" | "failed" | "abandoned";
+  attempts: number;
+  created_at: number;
+  resumed_at: number | null;
 }

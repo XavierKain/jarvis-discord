@@ -1,5 +1,5 @@
 import { Subprocess } from "bun";
-import type { StreamEvent, StreamResult, TodoItem, TokenUsage } from "./types.js";
+import type { StreamEvent, StreamResult, TodoItem, TokenUsage, CutInfo, CutReason } from "./types.js";
 
 // Mutable result tracker (written via closure in handleStreamEvent)
 interface SessionTracker {
@@ -18,6 +18,7 @@ export interface SessionCallbacks {
   onError: (error: string) => void;
   onSessionId: (sessionId: string) => void;
   onHeartbeat: () => void;
+  onCut?: (cut: CutInfo, sessionId: string | null, prompt: string) => void;
 }
 
 interface ActiveProcess {
@@ -226,22 +227,22 @@ export async function sendMessage(
     }
   };
 
-  // Process stderr
+  // Process stderr — also captures error text for cut detection
+  let stderrFull = "";
   const processStderr = async () => {
     const reader = proc.stderr.getReader();
     const decoder = new TextDecoder();
-    let stderrBuffer = "";
 
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        stderrBuffer += decoder.decode(value, { stream: true });
+        stderrFull += decoder.decode(value, { stream: true });
       }
     } catch {}
 
     // Filter out info/debug lines, only report real errors
-    const errorLines = stderrBuffer
+    const errorLines = stderrFull
       .split("\n")
       .filter(l => l.trim() && !l.includes("INFO") && !l.includes("DEBUG") && !l.includes("Compressing"))
       .join("\n");
@@ -277,6 +278,12 @@ export async function sendMessage(
     tracker.model,
   );
 
+  // === Cut detection ===
+  const cutInfo = detectCut(exitCode, stderrFull, tracker.result);
+  if (cutInfo && callbacks.onCut) {
+    callbacks.onCut(cutInfo, tracker.sessionId, message);
+  }
+
   // Fire onResult callback — use accumulated data if result event was missing
   if (tracker.result) {
     callbacks.onResult(tracker.result);
@@ -291,9 +298,100 @@ export async function sendMessage(
     });
   }
 
-  if (exitCode !== 0 && exitCode !== null) {
+  if (exitCode !== 0 && exitCode !== null && !cutInfo) {
     callbacks.onError(`Claude exited with code ${exitCode}`);
   }
+}
+
+/**
+ * Detect if a Claude session was cut due to rate limits, quotas, etc.
+ * Returns CutInfo if a cut was detected, null otherwise.
+ */
+function detectCut(exitCode: number | null, stderr: string, result: StreamResult | null): CutInfo | null {
+  const lower = stderr.toLowerCase();
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // Rate limit (API-level, usually short)
+  if (lower.includes("rate_limit") || lower.includes("rate limit") || lower.includes("429") || lower.includes("too many requests")) {
+    return {
+      reason: "rate_limit",
+      message: "Limite de débit API atteinte (rate limit). Reprise dans ~2 minutes.",
+      retryAfter: nowSec + 120,
+    };
+  }
+
+  // Monthly/billing quota exhausted
+  if (lower.includes("billing") || lower.includes("insufficient_quota") || lower.includes("quota exceeded") || lower.includes("spending limit") || lower.includes("monthly") || lower.includes("credit")) {
+    return {
+      reason: "monthly_quota",
+      message: "Quota mensuel / crédits épuisés. Reprise au prochain reset (1er du mois).",
+      retryAfter: getNextMonthReset(),
+    };
+  }
+
+  // Weekly usage limit (Claude Code subscription)
+  if (lower.includes("weekly") || lower.includes("usage limit") || lower.includes("week") || lower.includes("hebdomadaire")) {
+    return {
+      reason: "weekly_quota",
+      message: "Limite hebdomadaire Claude Code atteinte. Reprise au prochain lundi.",
+      retryAfter: getNextMondayReset(),
+    };
+  }
+
+  // Session 5h timeout
+  if (lower.includes("session duration") || lower.includes("session limit") || lower.includes("5 hour") || lower.includes("session expired") || lower.includes("maximum session")) {
+    return {
+      reason: "session_timeout",
+      message: "Session de 5h max atteinte. Reprise immédiate avec une nouvelle session.",
+      retryAfter: nowSec + 10, // Retry almost immediately with a new session
+    };
+  }
+
+  // Max turns reached (not really a "cut" but useful to know)
+  if (lower.includes("max turns") || lower.includes("maximum turns") || lower.includes("turn limit")) {
+    return {
+      reason: "max_turns",
+      message: "Nombre maximum de tours atteint.",
+      retryAfter: nowSec + 5,
+    };
+  }
+
+  // Check result.is_error with non-zero exit and no clear reason
+  // This catches "unexpected" cuts
+  if (exitCode && exitCode !== 0 && exitCode !== 42) {
+    // Only flag as cut if the process was actually doing something (had turns)
+    const hadTurns = result?.num_turns && result.num_turns > 0;
+    if (hadTurns) {
+      // Check if stderr mentions anything limit-related broadly
+      if (lower.includes("limit") || lower.includes("quota") || lower.includes("exceed") || lower.includes("capacity")) {
+        return {
+          reason: "unknown",
+          message: `Session coupée de manière inattendue (exit ${exitCode}). Reprise dans 5 min.`,
+          retryAfter: nowSec + 300,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Get unix timestamp for next Monday 00:00 UTC */
+function getNextMondayReset(): number {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Sun, 1=Mon, ...
+  const daysUntilMonday = day === 0 ? 1 : 8 - day;
+  const next = new Date(now);
+  next.setUTCDate(now.getUTCDate() + daysUntilMonday);
+  next.setUTCHours(0, 0, 0, 0);
+  return Math.floor(next.getTime() / 1000);
+}
+
+/** Get unix timestamp for 1st of next month 00:00 UTC */
+function getNextMonthReset(): number {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+  return Math.floor(next.getTime() / 1000);
 }
 
 function handleStreamEvent(

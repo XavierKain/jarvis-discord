@@ -20,8 +20,13 @@ import { getChannelMemories, needsCompaction, compactSession, POST_COMPACT_GUARD
 import {
   trackActivity, buildActivityDigest, parseRouteCommand,
 } from "./general-orchestrator.js";
-import type { TodoItem } from "./types.js";
+import type { TodoItem, PendingTask } from "./types.js";
 import { buildSkillPrompt, listSkills, reloadSkills } from "./skill-loader.js";
+import {
+  initAutoResume, stopAutoResume, savePendingTask,
+  formatCutMessage, formatTasksList,
+} from "./auto-resume.js";
+import { getAllPendingTasks, abandonPendingTask, countWaitingTasks } from "./database.js";
 
 // Message queue per channel (when session is busy)
 const messageQueues = new Map<string, { message: string; discordMsg: Message }[]>();
@@ -46,6 +51,11 @@ client.once("clientReady", () => {
 
   // Start the session timeout checker
   startTimeoutChecker();
+
+  // Start auto-resume checker
+  const waiting = countWaitingTasks();
+  if (waiting > 0) console.log(`🔄 ${waiting} tâche(s) en attente de reprise`);
+  initAutoResume(client, resumeTask);
 });
 
 client.on("messageCreate", async (message: Message) => {
@@ -168,12 +178,36 @@ client.on("interactionCreate", async (interaction: Interaction) => {
   }
 });
 
+/**
+ * Resume a pending task that was cut by a limit.
+ * Called by the auto-resume checker.
+ */
+async function resumeTask(task: PendingTask, channel: TextChannel) {
+  const channelId = task.channel_id;
+  const channelName = task.channel_name;
+
+  // Build the resume prompt
+  let resumePrompt: string;
+  if (task.cut_reason === "max_turns") {
+    resumePrompt = `Continue la tâche précédente. Voici le contexte:\n${task.context_summary || task.original_prompt}`;
+  } else {
+    // For rate limits / quotas, we resume with the original prompt
+    // If there's a session_id, claude --resume will pick up where it left off
+    resumePrompt = task.session_id
+      ? "Continue là où tu t'es arrêté. La session a été interrompue par une limite."
+      : task.original_prompt;
+  }
+
+  // Process the message normally — it will create a new claude session
+  await processMessage(channelId, channelName, resumePrompt, channel, null as any);
+}
+
 async function processMessage(
   channelId: string,
   channelName: string,
   content: string,
   channel: TextChannel,
-  discordMessage: Message,
+  discordMessage: Message | null,
 ) {
   const config = getChannelConfig(channelId, channelName);
 
@@ -216,7 +250,7 @@ async function processMessage(
   }
 
   // Show typing
-  await discordMessage.react("⚡");
+  if (discordMessage) await discordMessage.react("⚡");
 
   // Create streaming response handler
   const streamer = new StreamingResponse(channel);
@@ -260,7 +294,9 @@ async function processMessage(
       );
 
       // Remove reaction
-      try { await discordMessage.reactions.cache.get("⚡")?.users.remove(client.user!.id); } catch {}
+      if (discordMessage) {
+        try { await discordMessage.reactions.cache.get("⚡")?.users.remove(client.user!.id); } catch {}
+      }
 
       // Process queued messages
       processQueue(channelId, channelName, channel);
@@ -274,6 +310,18 @@ async function processMessage(
     },
     onHeartbeat: () => {
       streamer.heartbeat();
+    },
+    onCut: async (cut, sessionId, prompt) => {
+      if (config.autoResume) {
+        const taskId = savePendingTask(channelId, channelName, sessionId, prompt, cut);
+        await channel.send(formatCutMessage(cut, taskId));
+      } else {
+        // Auto-resume is off — just notify but don't queue
+        await channel.send(
+          `🔴 **Tâche coupée** — ${cut.message}\n` +
+          `ℹ️ Active l'auto-resume avec \`!set auto-resume true\` pour que les tâches reprennent automatiquement.`
+        );
+      }
     },
   };
 
@@ -525,8 +573,12 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
           // Value is comma-separated: "seo-audit,seo-content,seo-schema"
           settings.skills = value;
           break;
+        case "auto-resume":
+        case "autoresume":
+          settings.auto_resume = value === "true" || value === "1" || value === "on" ? 1 : 0;
+          break;
         default:
-          await channel.send(`❌ Clé inconnue: \`${key}\`. Valides: max-turns, model, compact-threshold, streaming, project-dir, skills`);
+          await channel.send(`❌ Clé inconnue: \`${key}\`. Valides: max-turns, model, compact-threshold, streaming, project-dir, skills, auto-resume`);
           return;
       }
 
@@ -566,6 +618,7 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
   Max turns: \`${config.maxTurns || "illimité"}\`
   Compaction: \`${config.compactThreshold} messages\`
   Streaming: \`${config.streaming}\`
+  Auto-resume: \`${config.autoResume}\`
   Project dir: \`${config.projectDir}\`
   System prompt: \`${config.systemPrompt.slice(0, 100)}...\``);
       }
@@ -667,6 +720,24 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
       break;
     }
 
+    case "tasks":
+    case "queue": {
+      const tasks = getAllPendingTasks();
+      await channel.send(formatTasksList(tasks));
+      break;
+    }
+
+    case "cancel": {
+      const taskId = parseInt(parts[1]);
+      if (isNaN(taskId)) {
+        await channel.send("**Usage:** `!cancel <id>` — Annuler une tâche en attente.");
+        break;
+      }
+      abandonPendingTask(taskId);
+      await channel.send(`🗑️ Tâche #${taskId} annulée.`);
+      break;
+    }
+
     case "help": {
       await channel.send(`**Commandes DisClawd:**
 \`!dashboard\` — 🦅 Interface de configuration interactive
@@ -681,6 +752,8 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
 \`!update\` — 📥 Mettre à jour depuis GitHub + redémarrage auto
 \`!version\` — Version actuelle
 \`!skills [channel]\` — Voir les skills chargés
+\`!tasks\` — 📋 Voir les tâches en attente de reprise
+\`!cancel <id>\` — 🗑️ Annuler une tâche en attente
 \`!help\` — Cette aide
 
 **Réactions rapides:**
@@ -703,6 +776,7 @@ async function handleCommand(cmd: string, channel: TextChannel, message: Message
 // Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\n🛑 Arrêt en cours...");
+  stopAutoResume();
   await shutdownAll();
   client.destroy();
   process.exit(0);
@@ -710,6 +784,7 @@ process.on("SIGINT", async () => {
 
 process.on("SIGTERM", async () => {
   console.log("\n🛑 SIGTERM reçu, arrêt...");
+  stopAutoResume();
   await shutdownAll();
   client.destroy();
   process.exit(0);
